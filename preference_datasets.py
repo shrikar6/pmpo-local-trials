@@ -71,13 +71,21 @@ def get_se(split, silent=False, cache_dir: str = None) -> Dict[str, Dict[str, Un
         responses = [' ' + a['text'] for a in row['answers']]
         scores = [a['pm_score'] for a in row['answers']]
 
-        pairs = []
-        for i in range(len(responses)):
-            for j in range(i + 1, len(responses)):
-                pairs.append((i, j) if scores[i] > scores[j] else (j, i))
+        # pairs = []
+        # for i in range(len(responses)):
+        #     for j in range(i + 1, len(responses)):
+        #         pairs.append((i, j) if scores[i] > scores[j] else (j, i))
 
-        data[prompt]['responses'] = responses
-        data[prompt]['pairs'] = pairs
+        # data[prompt]['responses'] = responses
+        # data[prompt]['pairs'] = pairs
+
+        responses = np.array(responses)
+        scores = np.array(scores)
+        order = np.argsort(scores)
+        responses = list(responses[order])
+        split_idx = len(responses) // 2
+        data[prompt]['preferred'] = responses[:split_idx]
+        data[prompt]['dispreferred'] = responses[split_idx:]
         data[prompt]['sft_target'] = max(responses, key=lambda x: scores[responses.index(x)])
 
     return data
@@ -97,21 +105,28 @@ def get_shp(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str
         prompt = '\n\nHuman: ' + row['history'] + '\n\nAssistant:'
         responses = [' ' + row['human_ref_A'], ' ' + row['human_ref_B']]
         scores = [row['score_A'], row['score_B']]
-        if prompt in data:
-            n_responses = len(data[prompt]['responses'])
-        else:
-            n_responses = 0
+        # if prompt in data:
+        #     n_responses = len(data[prompt]['responses'])
+        # else:
+        #     n_responses = 0
         score_ratio = max(scores[0] / scores[1], scores[1] / scores[0])
         if score_ratio < 2:
             continue
 
-        # according to https://huggingface.co/datasets/stanfordnlp/SHP
-        data[prompt]['pairs'].append((n_responses, n_responses + 1) if row['labels'] == 1 else (n_responses + 1, n_responses))
-        data[prompt]['responses'].extend(responses)
-        data[prompt]['scores'].extend(scores)
+        # # according to https://huggingface.co/datasets/stanfordnlp/SHP
+        # data[prompt]['pairs'].append((n_responses, n_responses + 1) if row['labels'] == 1 else (n_responses + 1, n_responses))
+        # data[prompt]['responses'].extend(responses)
+
+        if scores[1] > scores[0]:
+            responses = responses[::-1]
+            scores = scores[::-1]
+        data[prompt]['preferred'].append(responses[0])
+        data[prompt]['dispreferred'].append(responses[1])
+        data[prompt]['scores'].append(scores[0])
 
     for prompt in data:
-        data[prompt]['sft_target'] = max(data[prompt]['responses'], key=lambda x: data[prompt]['scores'][data[prompt]['responses'].index(x)])
+        # data[prompt]['sft_target'] = max(data[prompt]['responses'], key=lambda x: data[prompt]['scores'][data[prompt]['responses'].index(x)])
+        data[prompt]['sft_target'] = max(data[prompt]['preferred'], key=lambda x: data[prompt]['scores'][data[prompt]['preferred'].index(x)])
         del data[prompt]['scores']
 
     return data
@@ -151,10 +166,12 @@ def get_hh(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str,
     data = defaultdict(lambda: defaultdict(list))
     for row in tqdm.tqdm(dataset, desc='Processing HH', disable=silent):
         prompt, chosen, rejected = split_prompt_and_responses(row)
-        responses = [chosen, rejected]
-        n_responses = len(data[prompt]['responses'])
-        data[prompt]['pairs'].append((n_responses, n_responses + 1))
-        data[prompt]['responses'].extend(responses)
+        # responses = [chosen, rejected]
+        # n_responses = len(data[prompt]['responses'])
+        # data[prompt]['pairs'].append((n_responses, n_responses + 1))
+        # data[prompt]['responses'].extend(responses)
+        data[prompt]['preferred'].append(chosen)
+        data[prompt]['dispreferred'].append(rejected)
         data[prompt]['sft_target'] = chosen
 
     return data
@@ -171,7 +188,8 @@ def get_dataset(name: str, split: str, silent: bool = False, cache_dir: str = No
     else:
         raise ValueError(f"Unknown dataset '{name}'")
 
-    assert set(list(data.values())[0].keys()) == {'responses', 'pairs', 'sft_target'}, \
+    # assert set(list(data.values())[0].keys()) == {'responses', 'pairs', 'sft_target'}, \
+    assert set(list(data.values())[0].keys()) == {'preferred', 'dispreferred', 'sft_target'}, \
         f"Unexpected keys in dataset: {list(list(data.values())[0].keys())}"
 
     return data
@@ -277,6 +295,61 @@ def tokenize_batch_element(prompt: str, chosen: str, rejected: str, truncation_m
     return batch
 
 
+def tokenize_batch_element_decoupled(prompt: str, response: str, is_preferred: bool, truncation_mode: str, tokenizer, max_length: int, max_prompt_length: int) -> Dict:
+    """Tokenize a single batch element.
+    
+       At this stage, we don't convert to PyTorch tensors yet; we just handle the truncation
+         in case the prompt + chosen or prompt + rejected responses is/are too long. First
+         we truncate the prompt; if we're still too long, we truncate the chosen/rejected.
+       
+       We also create the labels for the chosen/rejected responses, which are of length equal to
+         the sum of the length of the prompt and the chosen/rejected response, with -100 for the
+         prompt tokens.
+    """
+    response_tokens = tokenizer(response, add_special_tokens=False)
+    prompt_tokens = tokenizer(prompt, add_special_tokens=False)
+
+    assert tokenizer.eos_token_id not in prompt_tokens['input_ids'], f"Prompt contains EOS token: {prompt}"
+    assert tokenizer.eos_token_id not in response_tokens['input_ids'], f"Response contains EOS token: {response}"
+
+    response_tokens['input_ids'].append(tokenizer.eos_token_id)
+    response_tokens['attention_mask'].append(1)
+
+    # if combined sequence is too long, truncate the prompt
+    if len(prompt_tokens['input_ids']) + len(response_tokens['input_ids']) > max_length:
+        if truncation_mode == 'keep_start':
+            prompt_tokens = {k: v[:max_prompt_length] for k, v in prompt_tokens.items()}
+        elif truncation_mode == 'keep_end':
+            prompt_tokens = {k: v[-max_prompt_length:] for k, v in prompt_tokens.items()}
+        else:
+            raise ValueError(f'Unknown truncation mode: {truncation_mode}')
+
+    # if that's still too long, truncate the response
+    if len(prompt_tokens['input_ids']) + len(response_tokens['input_ids']) > max_length:
+        response_tokens = {k: v[:max_length - max_prompt_length] for k, v in response_tokens.items()}
+
+    # Create labels
+    response_sequence_tokens = {k: prompt_tokens[k] + response_tokens[k] for k in response_tokens}
+    response_sequence_tokens['labels'] = response_sequence_tokens['input_ids'][:]
+    response_sequence_tokens['labels'][:len(prompt_tokens['input_ids'])] = [-100] * len(prompt_tokens['input_ids'])
+
+    batch = {}
+
+    key_str = 'chosen' if is_preferred else 'rejected'
+
+    batch['prompt'] = prompt
+    batch[f'{key_str}'] = prompt + response
+    batch[f'{key_str}_response_only'] = response
+
+    for k, toks in {f'{key_str}': response_sequence_tokens, 'prompt': prompt_tokens}.items():
+        for type_key, tokens in toks.items():
+            if type_key == 'token_type_ids':
+                continue
+            batch[f'{k}_{type_key}'] = tokens
+
+    return batch
+
+
 def get_batch_iterator(names: List[str],
                        tokenizer,
                        split: str = 'train',
@@ -289,7 +362,8 @@ def get_batch_iterator(names: List[str],
                        n_examples: Optional[int] = None,
                        seed:int = 0,
                        silent: bool = False,
-                       cache_dir: Optional[str] = None) -> Iterator[Dict]:
+                       cache_dir: Optional[str] = None,
+                       decouple_chosen_rejected: bool = False) -> Iterator[Dict]:
     """Get an iterator over batches of data. Stops after n_epochs or n_examples, whichever comes first.
 
     Args:
@@ -318,7 +392,8 @@ def get_batch_iterator(names: List[str],
         for name in names:
             truncation_mode = 'keep_end' if name == 'hh' else 'keep_start'
             for prompt, data in get_dataset(name, split, silent=silent, cache_dir=cache_dir).items():
-                flat_data.append((prompt, data['responses'], data['pairs'], data['sft_target'], truncation_mode))
+                # flat_data.append((prompt, data['responses'], data['pairs'], data['sft_target'], truncation_mode))
+                flat_data.append((prompt, data['preferred'], data['dispreferred'], data['sft_target'], truncation_mode))
 
     collate_fn = get_collate_fn(tokenizer)
 
@@ -335,7 +410,8 @@ def get_batch_iterator(names: List[str],
                 random.shuffle(flat_data)
 
         batch = []
-        for prompt, responses, pairs, sft_target, truncation_mode in flat_data:
+        # for prompt, responses, pairs, sft_target, truncation_mode in flat_data:
+        for prompt, preferred, dispreferred, sft_target, truncation_mode in flat_data:
             if done:
                 break
             if sft_mode:
@@ -351,11 +427,31 @@ def get_batch_iterator(names: List[str],
                         done = True
 
                     batch = []
-            else:
-                for p in pairs:
+            # else:
+            #     for p in pairs:
+            elif not decouple_chosen_rejected:
+                for c, r in zip(preferred, dispreferred):
                     if done:
                         break
-                    batch_element = tokenize_batch_element(prompt, responses[p[0]], responses[p[1]], truncation_mode, tokenizer, max_length, max_prompt_length)
+                    # batch_element = tokenize_batch_element(prompt, responses[p[0]], responses[p[1]], truncation_mode, tokenizer, max_length, max_prompt_length)
+                    batch_element = tokenize_batch_element(prompt, c, r, truncation_mode, tokenizer, max_length, max_prompt_length)
+                    batch.append(batch_element)
+                    example_idx += 1
+                    if len(batch) == batch_size:
+                        yield collate_fn(batch)
+                        if n_examples is not None and example_idx >= n_examples:
+                            if not silent:
+                                print(f'FINISHED {n_examples} EXAMPLES on {split} split')
+                            done = True
+                        batch = []
+            else:
+                responses_plus_preference = zip(preferred + dispreferred, [True] * len(preferred) + [False] * len(dispreferred))
+                with TemporarilySeededRandom(next(permutation_seeds)):
+                    random.shuffle(responses_plus_preference)
+                for response, is_preferred in responses_plus_preference:
+                    if done:
+                        break
+                    batch_element = tokenize_batch_element_decoupled(prompt, response, is_preferred, truncation_mode, tokenizer, max_length, max_prompt_length)
                     batch.append(batch_element)
                     example_idx += 1
                     if len(batch) == batch_size:

@@ -1,0 +1,9 @@
+# do PMPO preference-based training
+name: pmpo
+
+# the weight of positive samples in the loss function
+alpha: ???
+
+# the temperature parameter for PMPO; lower values mean we care less about
+#   the reference model
+beta: ???

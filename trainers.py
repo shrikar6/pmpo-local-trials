@@ -46,9 +46,12 @@ def preference_loss(policy_chosen_logps: torch.FloatTensor,
                     policy_rejected_logps: torch.FloatTensor,
                     reference_chosen_logps: torch.FloatTensor,
                     reference_rejected_logps: torch.FloatTensor,
-                    beta: float,
+                    # beta: float,
+                    alpha: float = 0.5,
+                    beta: float = 0.0,
                     label_smoothing: float = 0.0,
                     ipo: bool = False,
+                    pmpo: bool = False,
                     reference_free: bool = False) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
     """Compute the DPO loss for a batch of policy and reference model log probabilities.
 
@@ -67,19 +70,22 @@ def preference_loss(policy_chosen_logps: torch.FloatTensor,
         The losses tensor contains the DPO loss for each example in the batch.
         The chosen_rewards and rejected_rewards tensors contain the rewards for the chosen and rejected responses, respectively.
     """
-    pi_logratios = policy_chosen_logps - policy_rejected_logps
-    ref_logratios = reference_chosen_logps - reference_rejected_logps
 
-    if reference_free:
-        ref_logratios = 0
-
-    logits = pi_logratios - ref_logratios  # also known as h_{\pi_\theta}^{y_w,y_l}
-
-    if ipo:
-        losses = (logits - 1/(2 * beta)) ** 2  # Eq. 17 of https://arxiv.org/pdf/2310.12036v2.pdf
+    if pmpo:
+        losses = -alpha * policy_chosen_logps + (1 - alpha) * policy_rejected_logps + beta * (policy_chosen_logps - reference_chosen_logps) + beta * (policy_rejected_logps - reference_rejected_logps)
     else:
-        # Eq. 3 https://ericmitchell.ai/cdpo.pdf; label_smoothing=0 gives original DPO (Eq. 7 of https://arxiv.org/pdf/2305.18290.pdf)
-        losses = -F.logsigmoid(beta * logits) * (1 - label_smoothing) - F.logsigmoid(-beta * logits) * label_smoothing
+        pi_logratios = policy_chosen_logps - policy_rejected_logps
+        ref_logratios = reference_chosen_logps - reference_rejected_logps
+
+        if reference_free:
+            ref_logratios = 0
+
+        logits = pi_logratios - ref_logratios  # also known as h_{\pi_\theta}^{y_w,y_l}
+        if ipo:
+            losses = (logits - 1/(2 * beta)) ** 2  # Eq. 17 of https://arxiv.org/pdf/2310.12036v2.pdf
+        else:
+            # Eq. 3 https://ericmitchell.ai/cdpo.pdf; label_smoothing=0 gives original DPO (Eq. 7 of https://arxiv.org/pdf/2305.18290.pdf)
+            losses = -F.logsigmoid(beta * logits) * (1 - label_smoothing) - F.logsigmoid(-beta * logits) * label_smoothing
 
     chosen_rewards = beta * (policy_chosen_logps - reference_chosen_logps).detach()
     rejected_rewards = beta * (policy_rejected_logps - reference_rejected_logps).detach()
@@ -188,7 +194,7 @@ class BasicTrainer(object):
             policy_output = self.policy.generate(
                 batch['prompt_input_ids'], attention_mask=batch['prompt_attention_mask'], max_length=self.config.max_length, do_sample=True, pad_token_id=self.tokenizer.pad_token_id)
 
-        if self.config.loss.name in {'dpo', 'ipo'}:
+        if self.config.loss.name in {'dpo', 'ipo', 'pmpo'}:
             ctx = lambda: (FSDP.summon_full_params(self.reference_model, writeback=False, recurse=False) if 'FSDP' in self.config.trainer else contextlib.nullcontext())
             with ctx():
                 reference_output = self.reference_model.generate(
@@ -198,7 +204,7 @@ class BasicTrainer(object):
         policy_output = all_gather_if_needed(policy_output, self.rank, self.world_size)
         policy_output_decoded = self.tokenizer.batch_decode(policy_output, skip_special_tokens=True)
 
-        if self.config.loss.name in {'dpo', 'ipo'}:
+        if self.config.loss.name in {'dpo', 'ipo', 'pmpo'}:
             reference_output = pad_to_length(reference_output, self.config.max_length, self.tokenizer.pad_token_id)
             reference_output = all_gather_if_needed(reference_output, self.rank, self.world_size)
             reference_output_decoded = self.tokenizer.batch_decode(reference_output, skip_special_tokens=True)
@@ -226,7 +232,7 @@ class BasicTrainer(object):
         metrics = {}
         train_test = 'train' if train else 'eval'
 
-        if loss_config.name in {'dpo', 'ipo'}:
+        if loss_config.name in {'dpo', 'ipo', 'pmpo'}:
             policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.policy, batch)
             with torch.no_grad():
                 reference_chosen_logps, reference_rejected_logps = self.concatenated_forward(self.reference_model, batch)
@@ -235,6 +241,8 @@ class BasicTrainer(object):
                 loss_kwargs = {'beta': loss_config.beta, 'reference_free': loss_config.reference_free, 'label_smoothing': loss_config.label_smoothing, 'ipo': False}
             elif loss_config.name == 'ipo':
                 loss_kwargs = {'beta': loss_config.beta, 'ipo': True}
+            elif loss_config.name == 'pmpo':
+                loss_kwargs = {'alpha': loss_config.alpha, 'beta': loss_config.beta, 'pmpo': True}
             else:
                 raise ValueError(f'unknown loss {loss_config.name}')
 
@@ -280,7 +288,7 @@ class BasicTrainer(object):
         np.random.seed(self.seed)
         random.seed(self.seed)
 
-        if self.config.loss.name in {'dpo', 'ipo'}:
+        if self.config.loss.name in {'dpo', 'ipo', 'pmpo'}:
             self.reference_model.eval()
 
         self.example_counter = 0
@@ -297,7 +305,7 @@ class BasicTrainer(object):
                 if self.config.sample_during_eval:
                     all_policy_samples, all_reference_samples = [], []
                     policy_text_table = wandb.Table(columns=["step", "prompt", "sample"])
-                    if self.config.loss.name in {'dpo', 'ipo'}:
+                    if self.config.loss.name in {'dpo', 'ipo', 'pmpo'}:
                         reference_text_table = wandb.Table(columns=["step", "prompt", "sample"])
 
                 for eval_batch in (tqdm.tqdm(self.eval_batches, desc='Computing eval metrics') if self.rank == 0 else self.eval_batches):
@@ -324,7 +332,7 @@ class BasicTrainer(object):
 
                         for prompt, sample in zip(eval_batch['prompt'], policy_samples):
                             policy_text_table.add_data(self.example_counter, prompt, sample)
-                        if self.config.loss.name in {'dpo', 'ipo'}:
+                        if self.config.loss.name in {'dpo', 'ipo', 'pmpo'}:
                             for prompt, sample in zip(eval_batch['prompt'], reference_samples):
                                 reference_text_table.add_data(self.example_counter, prompt, sample)
 
@@ -332,7 +340,7 @@ class BasicTrainer(object):
                 rank0_print(f'eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}')
                 if self.config.sample_during_eval:                    
                     rank0_print(json.dumps(all_policy_samples[:10], indent=2))
-                    if self.config.loss.name in {'dpo', 'ipo'}:
+                    if self.config.loss.name in {'dpo', 'ipo', 'pmpo'}:
                         rank0_print(json.dumps(all_reference_samples[:10], indent=2))
 
                 if self.config.wandb.enabled and self.rank == 0:
@@ -340,7 +348,7 @@ class BasicTrainer(object):
 
                     if self.config.sample_during_eval:
                         wandb.log({"policy_samples": policy_text_table}, step=self.example_counter)
-                        if self.config.loss.name in {'dpo', 'ipo'}:
+                        if self.config.loss.name in {'dpo', 'ipo', 'pmpo'}:
                             wandb.log({"reference_samples": reference_text_table}, step=self.example_counter)
 
                 if self.example_counter > 0:
@@ -483,7 +491,7 @@ class FSDPTrainer(BasicTrainer):
                 apply_activation_checkpointing(self.policy, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check_fn)
                 rank0_print('FSDP activation checkpointing enabled!')
 
-        if config.loss.name in {'dpo', 'ipo'}:
+        if config.loss.name in {'dpo', 'ipo', 'pmpo'}:
             rank0_print('Sharding reference model...')
             self.reference_model = FSDP(reference_model, **shared_fsdp_kwargs)
         
@@ -531,7 +539,7 @@ class TensorParallelTrainer(BasicTrainer):
         
         rank0_print('Sharding policy...')
         self.policy = tp.tensor_parallel(policy, sharded=True)
-        if config.loss.name in {'dpo', 'ipo'}:
+        if config.loss.name in {'dpo', 'ipo', 'pmpo'}:
             rank0_print('Sharding reference model...')
             self.reference_model = tp.tensor_parallel(reference_model, sharded=False)
 
