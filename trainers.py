@@ -72,7 +72,7 @@ def preference_loss(policy_chosen_logps: torch.FloatTensor,
     """
 
     if pmpo:
-        losses = -alpha * policy_chosen_logps + (1 - alpha) * policy_rejected_logps + beta * (policy_chosen_logps - reference_chosen_logps) + beta * (policy_rejected_logps - reference_rejected_logps)
+        losses = -alpha * policy_chosen_logps + (1 - alpha) * policy_rejected_logps + beta * ((reference_chosen_logps + reference_rejected_logps) - (policy_chosen_logps + policy_rejected_logps))
     else:
         pi_logratios = policy_chosen_logps - policy_rejected_logps
         ref_logratios = reference_chosen_logps - reference_rejected_logps
